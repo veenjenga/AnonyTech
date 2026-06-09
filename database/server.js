@@ -371,3 +371,250 @@ if (process.env.NODE_ENV !== "production") {
     }
   });
 }
+// ============================================================
+// ELECTION CONFIG
+// ============================================================
+
+app.get("/api/config", async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, election_name, election_description, voting_method,
+            is_sealed, is_tally_released,
+            start_date, end_date, created_at, updated_at
+     FROM election_config LIMIT 1`
+  );
+  if (!rows.length) return res.status(404).json({ error: "No config found" });
+  res.json({ ...rows[0], voting_method: toFrontendMethod(rows[0].voting_method) });
+});
+
+app.patch("/api/config", requireAdmin, async (req, res) => {
+  const { votingMethod, startDate, endDate, isSealed, isTallyReleased,
+          electionName, electionDescription } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE election_config SET
+       election_name        = COALESCE($1, election_name),
+       election_description = COALESCE($2, election_description),
+       voting_method        = COALESCE($3, voting_method),
+       start_date           = COALESCE($4::timestamptz, start_date),
+       end_date             = COALESCE($5::timestamptz, end_date),
+       is_sealed            = COALESCE($6, is_sealed),
+       is_tally_released    = COALESCE($7, is_tally_released),
+       updated_at           = NOW()
+     WHERE id = (SELECT id FROM election_config LIMIT 1)
+     RETURNING *`,
+    [
+      electionName    ?? null,
+      electionDescription !== undefined ? electionDescription : null,
+      votingMethod ? toDbMethod(votingMethod) : null,
+      startDate ?? null,
+      endDate   ?? null,
+      isSealed  ?? null,
+      isTallyReleased ?? null,
+    ]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Config not found" });
+  await audit(req.adminEmail, "UPDATE_CONFIG", "election", rows[0].id, req.body);
+  res.json({ ...rows[0], voting_method: toFrontendMethod(rows[0].voting_method) });
+});
+
+app.post("/api/config/seal", requireAdmin, async (req, res) => {
+  const { rows } = await pool.query(
+    `UPDATE election_config SET is_sealed = TRUE, updated_at = NOW()
+     WHERE id = (SELECT id FROM election_config LIMIT 1)
+     RETURNING *`
+  );
+  if (!rows.length) return res.status(404).json({ error: "Config not found" });
+
+  const electionId = String(rows[0].id);
+  await audit(req.adminEmail, "SEAL_ELECTION", "election", rows[0].id);
+
+  try {
+    const cryptoResp = await fetch(`${CRYPTO_API_URL}/crypto/open-election`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ election_id: electionId }),
+    });
+    const text = await cryptoResp.text();
+    let cryptoData;
+    try { cryptoData = JSON.parse(text); } catch { cryptoData = { error: text }; }
+    if (!cryptoResp.ok) console.warn("[Crypto] open-election failed:", cryptoData);
+    else console.log(` [Crypto] Election ${electionId} opened.`);
+  } catch (e) {
+    console.warn("[Crypto] Could not open election:", e.message);
+  }
+
+  autoSeedCryptoVoters();
+  res.json({ ...rows[0], voting_method: toFrontendMethod(rows[0].voting_method) });
+});
+
+app.post("/api/config/tally", requireAdmin, async (req, res) => {
+  const { rows: cfgRows } = await pool.query("SELECT * FROM election_config LIMIT 1");
+  if (!cfgRows.length) return res.status(404).json({ error: "Config not found" });
+
+  const electionId = String(cfgRows[0].id);
+
+  const safeJson = async (resp) => {
+    const t = await resp.text();
+    try { return JSON.parse(t); } catch { return { error: t }; }
+  };
+
+  // ── Step 1: Close the crypto election (idempotent — 403 means already closed)
+  try {
+    const r = await fetch(`${CRYPTO_API_URL}/crypto/close-election`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+    });
+    const d = await safeJson(r);
+    if (r.ok || r.status === 403) {
+      console.log(` [Crypto] Election ${electionId} close confirmed (status ${r.status}).`);
+    } else {
+      console.warn("[Crypto] close-election unexpected response:", r.status, d);
+    }
+  } catch (e) {
+    console.warn("[Crypto] close-election failed (non-fatal for tally):", e.message);
+  }
+
+  // ── Step 2: Run the tally
+  let tallyResult = null;
+  let tallyOk = false;
+  try {
+    const tallyResp = await fetch(`${CRYPTO_API_URL}/crypto/tally`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ election_id: electionId }),
+    });
+    tallyResult = await safeJson(tallyResp);
+    if (!tallyResp.ok) {
+      // Surface the actual error detail from the crypto layer
+      const errDetail = tallyResult?.detail || tallyResult?.error || "Unknown crypto error";
+      console.error(`[Crypto] tally failed (${tallyResp.status}):`, errDetail);
+      // Return early with the actual error so the admin sees what went wrong
+      return res.status(tallyResp.status).json({
+        error: `Tally failed: ${errDetail}`,
+        crypto_detail: tallyResult,
+      });
+    }
+    tallyOk = true;
+    console.log(`[Crypto] Tally complete:`, tallyResult);
+  } catch (e) {
+    console.error("[Crypto] tally call failed:", e.message);
+    return res.status(502).json({
+      error: `Crypto service error during tally: ${e.message}`,
+    });
+  }
+
+  // ── Step 3: Only mark tally released if crypto tally succeeded
+  // ── Step 3: Ensure ALL candidates appear in tally_results (even 0 votes)
+  await pool.query(
+    `INSERT INTO tally_results (role_id, candidate_id, vote_count)
+     SELECT c.role_id, c.id, 0
+     FROM candidates c
+     WHERE NOT EXISTS (
+       SELECT 1 FROM tally_results tr
+       WHERE tr.role_id = c.role_id AND tr.candidate_id = c.id
+     )`
+  );
+
+  // ── Step 4: Mark tally released
+  const { rows } = await pool.query(
+    `UPDATE election_config SET is_tally_released = TRUE, updated_at = NOW()
+     WHERE id = $1 RETURNING *`,
+    [cfgRows[0].id]
+  );
+
+  await audit(req.adminEmail, "RELEASE_TALLY", "election", rows[0].id, { tallyResult });
+});
+
+app.post("/api/config/reset", requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1. Reset election config
+    const { rows } = await client.query(
+      `UPDATE election_config SET
+         is_sealed = FALSE, is_tally_released = FALSE,
+         start_date = NULL, end_date = NULL, updated_at = NOW()
+       WHERE id = (SELECT id FROM election_config LIMIT 1)
+       RETURNING *`
+    );
+    if (!rows.length) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Config not found" }); }
+
+    // 2. Clear tally results
+    await client.query("DELETE FROM tally_results");
+
+    // 3. Clear all ballots from previous election
+    await client.query("DELETE FROM ballots");
+
+    // 4. Reset all voters so they can vote in the new election
+    await client.query("UPDATE voters SET has_voted = FALSE, voted_at = NULL");
+
+    // 5. Clear voter journey records
+    await client.query("DELETE FROM voter_journey");
+
+    // 6. Reset department election states
+    await client.query("UPDATE dept_election_states SET is_sealed = FALSE, is_tally_released = FALSE, updated_at = NOW()");
+
+    // 7. Clear support tickets and feedback (audit log is PRESERVED)
+    await client.query("DELETE FROM support_tickets");
+    await client.query("DELETE FROM feedback");
+
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("[Reset] Transaction failed:", e.message);
+    return res.status(500).json({ error: "Reset failed: " + e.message });
+  } finally {
+    client.release();
+  }
+
+  // Log the reset in audit (this is preserved across elections)
+  await audit(req.adminEmail, "FULL_ELECTION_RESET", "election", "1", {
+    note: "Full election reset — all ballots, votes, journeys, and tally cleared. Audit log preserved.",
+    cleared: ["tally_results", "ballots", "voter_journey", "support_tickets", "feedback", "voters.has_voted"],
+    preserved: ["audit_log", "voters", "candidates", "roles", "departments"],
+  });
+
+  // Close the crypto election and reset all voter credentials
+  const safeJson = async (resp) => {
+    const t = await resp.text();
+    try { return JSON.parse(t); } catch { return { error: t }; }
+  };
+
+  try {
+    const r = await fetch(`${CRYPTO_API_URL}/crypto/close-election`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+    });
+    if (r.ok || r.status === 403) console.log("[Reset] Crypto election closed.");
+  } catch (e) {
+    console.warn("[Reset] close-election (non-fatal):", e.message);
+  }
+
+  // Reset all voter crypto credentials so they can re-register for new election
+  try {
+    const { rows: voters } = await pool.query(
+      "SELECT student_id FROM voters WHERE student_id IS NOT NULL"
+    );
+    for (const v of voters) {
+      try {
+        await fetch(`${CRYPTO_API_URL}/crypto/reset-voter`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ voter_id: v.student_id }),
+        });
+      } catch { /* non-fatal per voter */ }
+    }
+    console.log(`[Reset] Reset crypto credentials for ${voters.length} voters.`);
+  } catch (e) {
+    console.warn("[Reset] Voter credential reset (non-fatal):", e.message);
+  }
+
+  // Reset auto-end failure counter
+  autoEndFailures = 0;
+
+  const { rows: freshConfig } = await pool.query("SELECT * FROM election_config LIMIT 1");
+  console.log(`[Reset] Full election reset by ${req.adminEmail}`);
+  res.json({
+    ...(freshConfig[0] || {}),
+    voting_method: toFrontendMethod(freshConfig[0]?.voting_method),
+    message: "Election fully reset. All voters can now participate in the new election.",
+  });
+});
