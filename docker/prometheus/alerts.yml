@@ -1,0 +1,56 @@
+groups:
+  - name: evoting_failure_detection
+    rules:
+
+      # ── Power Failure ──────────────────────────────────────────────────────
+      - alert: PowerFailureDetected
+        expr: up{job="evoting_api"} == 0
+        for: 10s
+        labels:
+          severity: critical
+          failure_type: power
+        annotations:
+          summary: "E-voting API is down — possible power failure"
+          description: "Trigger WAL replay recovery protocol."
+
+      # ── Network Partition ─────────────────────────────────────────────────
+      - alert: NetworkPartitionDetected
+        expr: up{job="cockroachdb"} == 0
+        for: 15s
+        labels:
+          severity: critical
+          failure_type: network
+        annotations:
+          summary: "CockroachDB node unreachable — network partition"
+          description: "CockroachDB auto-rebalancing should activate."
+
+      # ── Storage Corruption ────────────────────────────────────────────────
+      - alert: StorageCorruptionDetected
+        expr: evoting_wal_errors_total > 0
+        for: 5s
+        labels:
+          severity: critical
+          failure_type: storage
+        annotations:
+          summary: "WAL errors detected — possible storage corruption"
+          description: "Trigger checkpoint recovery from last valid WAL."
+
+      # ── Client Disconnect ─────────────────────────────────────────────────
+      - alert: HighClientDisconnectRate
+        expr: rate(evoting_client_disconnects_total[1m]) > 10
+        for: 30s
+        labels:
+          severity: warning
+          failure_type: client
+        annotations:
+          summary: "High client disconnect rate detected"
+          description: "Service Worker offline cache should be absorbing votes."
+
+      # ── Vote Loss Risk ────────────────────────────────────────────────────
+      - alert: RedisAOFBehind
+        expr: redis_aof_last_rewrite_duration_sec > 30
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis AOF rewrite taking too long"
