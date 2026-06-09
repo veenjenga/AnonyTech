@@ -1255,3 +1255,286 @@ app.get("/api/journey/:voterId", async (req, res) => {
   if (!rows.length) return res.status(404).json({ error: "Journey not found" });
   res.json(rows[0]);
 });
+
+// ============================================================
+// AUDIT LOG
+// ============================================================
+
+app.get("/api/audit", requireAdmin, async (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit) || 50, 500);
+  const offset = parseInt(req.query.offset) || 0;
+  const { rows } = await pool.query(
+    "SELECT * FROM audit_log ORDER BY occurred_at DESC LIMIT $1 OFFSET $2",
+    [limit, offset]
+  );
+  res.json(rows);
+});
+
+// FIX: Frontend AdminTallyHub fetches /api/audit-log (not /api/audit)
+// Add alias so both paths work
+app.get("/api/audit-log", requireAdmin, async (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit) || 50, 500);
+  const offset = parseInt(req.query.offset) || 0;
+  const { rows } = await pool.query(
+    `SELECT id AS block_id,
+            action || ' — ' || COALESCE(target_type, '') AS label,
+            TRUE AS verified,
+            occurred_at
+     FROM audit_log
+     ORDER BY occurred_at DESC
+     LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  res.json(rows);
+});
+
+// Download audit log as CSV
+app.get("/api/audit-log/download", requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, actor, action, target_type, target_id, metadata, occurred_at FROM audit_log ORDER BY occurred_at DESC"
+    );
+    const header = "ID,Actor,Action,Target Type,Target ID,Metadata,Occurred At\n";
+    const csvRows = rows.map(r =>
+      [
+        r.id,
+        `"${(r.actor || '').replace(/"/g, '""')}"`,
+        `"${(r.action || '').replace(/"/g, '""')}"`,
+        `"${(r.target_type || '').replace(/"/g, '""')}"`,
+        `"${(r.target_id || '').replace(/"/g, '""')}"`,
+        `"${(typeof r.metadata === 'object' ? JSON.stringify(r.metadata) : (r.metadata || '')).replace(/"/g, '""')}"`,
+        r.occurred_at,
+      ].join(",")
+    ).join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename=audit_log_${new Date().toISOString().split('T')[0]}.csv`);
+    res.send(header + csvRows);
+  } catch (e) {
+    res.status(500).json({ error: "Failed to generate audit CSV: " + e.message });
+  }
+});
+
+// ============================================================
+// SUPPORT TICKETS
+// ============================================================
+
+app.post("/api/support", async (req, res) => {
+  const { voterId, email, fullName, message } = req.body;
+  if (!message) return res.status(400).json({ error: "message required" });
+  const { rows } = await pool.query(
+    `INSERT INTO support_tickets (voter_id, email, full_name, message)
+     VALUES ($1, $2, $3, $4) RETURNING *`,
+    [voterId || null, email || null, fullName || null, message]
+  );
+  res.status(201).json(rows[0]);
+});
+
+app.get("/api/support", requireAdmin, async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM support_tickets ORDER BY created_at DESC");
+  res.json(rows);
+});
+
+app.patch("/api/support/:id", requireAdmin, async (req, res) => {
+  const { status } = req.body;
+  const { rows } = await pool.query(
+    "UPDATE support_tickets SET status = $1 WHERE id = $2 RETURNING *",
+    [status, req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Ticket not found" });
+  res.json(rows[0]);
+});
+
+// ============================================================
+// FEEDBACK
+// ============================================================
+
+app.post("/api/feedback", async (req, res) => {
+  const { voterId, rating, comment } = req.body;
+  if (!rating || rating < 1 || rating > 5)
+    return res.status(400).json({ error: "rating must be 1–5" });
+  const { rows } = await pool.query(
+    "INSERT INTO feedback (voter_id, rating, comment) VALUES ($1, $2, $3) RETURNING *",
+    [voterId || null, rating, comment || null]
+  );
+  res.status(201).json(rows[0]);
+});
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+
+app.get("/api/health", async (req, res) => {
+  await pool.query("SELECT 1");
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// ============================================================
+// CRYPTO PROXY ENDPOINTS
+// ============================================================
+
+app.get("/api/crypto/status",              async (req, res) => cryptoProxy(res, "GET",  "/crypto/status"));
+app.get("/api/crypto/paillier-public-key", async (req, res) => cryptoProxy(res, "GET",  "/crypto/paillier-public-key"));
+app.get("/api/crypto/bulletin-board",      async (req, res) => cryptoProxy(res, "GET",  "/crypto/bulletin-board"));
+app.get("/api/crypto/zkp-test",            async (req, res) => cryptoProxy(res, "GET",  "/crypto/zkp-test"));
+
+app.get("/api/crypto/tally/:electionId", async (req, res) => {
+  await cryptoProxy(res, "GET", `/crypto/tally/${req.params.electionId}`);
+});
+
+app.post("/api/crypto/seed-voters", requireAdmin, async (req, res) => {
+  const { rows } = await pool.query(
+    "SELECT student_id FROM voters WHERE role = 'voter' AND student_id IS NOT NULL"
+  );
+  const voter_ids = rows.map(r => r.student_id).filter(Boolean);
+  if (!voter_ids.length) return res.status(400).json({ error: "No voters found in Postgres" });
+  await audit(req.adminEmail, "CRYPTO_SEED_VOTERS", "system", null, { count: voter_ids.length });
+  await cryptoProxy(res, "POST", "/crypto/seed-voters", { voter_ids });
+});
+
+app.post("/api/crypto/register/:studentId", async (req, res) => {
+  const { studentId } = req.params;
+  const { rows } = await pool.query(
+    "SELECT student_id FROM voters WHERE student_id = $1 LIMIT 1", [studentId]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Voter not found in Postgres" });
+  await cryptoProxy(res, "POST", "/crypto/register", { voter_id: studentId });
+});
+
+app.post("/api/crypto/cast-vote", async (req, res) => {
+  const { studentId, voteValue, roleId, isFake } = req.body;
+  if (!studentId || voteValue === undefined || !roleId)
+    return res.status(400).json({ error: "studentId, voteValue and roleId are required" });
+
+  const { rows } = await pool.query(
+    "SELECT id, has_voted FROM voters WHERE student_id = $1 LIMIT 1", [studentId]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Voter not found" });
+
+  const r = await fetch(`${CRYPTO_API_URL}/crypto/cast-vote`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      voter_id: studentId, vote_value: parseInt(voteValue),
+      role_id: roleId, is_fake: isFake || false,
+    }),
+  });
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { error: text }; }
+  if (!r.ok) return res.status(r.status).json(data);
+
+  if (!isFake) {
+    await pool.query(
+      "UPDATE voters SET has_voted = TRUE, voted_at = NOW() WHERE student_id = $1", [studentId]
+    );
+  }
+  res.json(data);
+});
+
+app.post("/api/crypto/open-election", requireAdmin, async (req, res) => {
+  const { electionId } = req.body;
+  await audit(req.adminEmail, "CRYPTO_OPEN_ELECTION", "election", null, { electionId });
+  await cryptoProxy(res, "POST", "/crypto/open-election", { election_id: electionId });
+});
+
+app.post("/api/crypto/close-election", requireAdmin, async (req, res) => {
+  await audit(req.adminEmail, "CRYPTO_CLOSE_ELECTION", "election", null);
+  await cryptoProxy(res, "POST", "/crypto/close-election");
+});
+
+app.post("/api/crypto/tally", requireAdmin, async (req, res) => {
+  const { electionId } = req.body;
+  await audit(req.adminEmail, "CRYPTO_TALLY", "election", null, { electionId });
+  await cryptoProxy(res, "POST", "/crypto/tally", { election_id: electionId });
+});
+
+app.post("/api/crypto/reset-voter", requireAdmin, async (req, res) => {
+  const { studentId } = req.body;
+  if (!studentId) return res.status(400).json({ error: "studentId required" });
+  await cryptoProxy(res, "POST", "/crypto/reset-voter", { voter_id: studentId });
+});
+
+// ============================================================
+// PLUGIN ENGINE PROXY  (FastAPI app/main.py, :8000)
+// Voting-method tally engine + Graceful Degradation Protocol.
+// The React admin UI calls these via the Node gateway so everything
+// goes through one origin (and admin actions are audited here).
+// ============================================================
+
+// Plugin engine health + active plugin info
+app.get("/api/plugin/health", async (req, res) => pluginProxy(res, "GET", "/health"));
+app.get("/api/plugin/info",   async (req, res) => pluginProxy(res, "GET", "/plugin/info"));
+
+// Switch the active voting method (persists to the SHARED election_config row)
+app.post("/api/plugin/switch", requireAdmin, async (req, res) => {
+  const { method } = req.body;
+  if (!method) return res.status(400).json({ error: "method is required" });
+  await audit(req.adminEmail, "PLUGIN_SWITCH", "election", null, { method });
+  await pluginProxy(res, "POST", "/plugin/switch", { method });
+});
+
+// Method-engine tally over the plugin engine's own ballot store
+app.get("/api/plugin/tally/:electionId", async (req, res) =>
+  pluginProxy(res, "GET", `/election/${encodeURIComponent(req.params.electionId)}/tally`)
+);
+
+// ============================================================
+// DISASTER RECOVERY PROXY  (Graceful Degradation Protocol)
+// Used by the admin dashboard Security tab.
+// ============================================================
+
+app.post("/api/recovery/initiate", requireAdmin, async (req, res) => {
+  const { electionId, failureEvent } = req.body;
+  if (!electionId) return res.status(400).json({ error: "electionId is required" });
+  await audit(req.adminEmail, "RECOVERY_INITIATE", "election", electionId, {
+    failureEvent: failureEvent || {},
+  });
+  await pluginProxy(res, "POST", "/recovery/initiate", {
+    election_id:   String(electionId),
+    failure_event: failureEvent || {},
+  });
+});
+
+app.get("/api/recovery/:electionId/audit-report", async (req, res) =>
+  pluginProxy(res, "GET", `/recovery/${encodeURIComponent(req.params.electionId)}/audit-report`)
+);
+
+// ============================================================
+// UNIFIED SYSTEM HEALTH  (Node + Postgres + crypto + plugin engine)
+// ============================================================
+
+app.get("/api/system/health", async (req, res) => {
+  const ping = async (url) => {
+    try { const r = await fetch(url); return { ok: r.ok, status: r.status }; }
+    catch (e) { return { ok: false, status: 0, error: e.message }; }
+  };
+
+  let dbOk = true;
+  try { await pool.query("SELECT 1"); } catch { dbOk = false; }
+
+  const [cryptoHealth, pluginHealth] = await Promise.all([
+    ping(`${CRYPTO_API_URL}/crypto/status`),
+    ping(`${PLUGIN_API_URL}/health`),
+  ]);
+
+  res.json({
+    node:       { ok: true, port: PORT },
+    database:   { ok: dbOk },
+    crypto:     { ok: cryptoHealth.ok, url: CRYPTO_API_URL, status: cryptoHealth.status },
+    plugin:     { ok: pluginHealth.ok, url: PLUGIN_API_URL, status: pluginHealth.status },
+    allHealthy: dbOk && cryptoHealth.ok && pluginHealth.ok,
+    timestamp:  new Date().toISOString(),
+  });
+});
+
+// ============================================================
+// GLOBAL ERROR HANDLER
+// ============================================================
+
+app.use((err, req, res, _next) => {
+  console.error(err);
+  res.status(err.status || 500).json({
+    error: err.message || "Internal server error",
+    ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
+  });
+});
