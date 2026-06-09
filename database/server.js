@@ -1538,3 +1538,102 @@ app.use((err, req, res, _next) => {
     ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
   });
 });
+// ============================================================
+// AUTO-END: check every 30s if end_date has passed → close + tally
+// ============================================================
+
+let autoEndFailures = 0;
+const MAX_AUTO_END_RETRIES = 5;
+
+setInterval(async () => {
+  if (autoEndFailures >= MAX_AUTO_END_RETRIES) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, end_date, is_sealed, is_tally_released
+       FROM election_config
+       WHERE is_sealed = TRUE
+         AND is_tally_released = FALSE
+         AND end_date IS NOT NULL
+         AND end_date <= NOW()
+       LIMIT 1`
+    );
+    if (!rows.length) return;
+
+    const electionId = String(rows[0].id);
+    console.log(`\n⏰ [Auto-End] end_date reached for election ${electionId}. Closing and tallying...`);
+
+    const safeJson = async (r) => {
+      const t = await r.text();
+      try { return JSON.parse(t); } catch { return { error: t }; }
+    };
+
+    // Step 1: close the crypto election
+    try {
+      const r = await fetch(`${CRYPTO_API_URL}/crypto/close-election`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+      });
+      const d = await safeJson(r);
+      if (r.ok || r.status === 403) {
+        console.log(` [Auto-End] Election ${electionId} closed (status ${r.status}).`);
+      } else {
+        console.warn("[Auto-End] close-election unexpected:", r.status, d);
+      }
+    } catch (e) {
+      console.warn("[Auto-End] close-election failed:", e.message);
+    }
+
+    // Step 2: run the tally
+    try {
+      const tallyResp = await fetch(`${CRYPTO_API_URL}/crypto/tally`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ election_id: electionId }),
+      });
+      const tallyData = await safeJson(tallyResp);
+      if (tallyResp.ok) {
+        console.log(` [Auto-End] Tally complete for election ${electionId}.`);
+        // Backfill all candidates with 0 votes if not already in tally
+        await pool.query(
+          `INSERT INTO tally_results (role_id, candidate_id, vote_count)
+           SELECT c.role_id, c.id, 0
+           FROM candidates c
+           WHERE NOT EXISTS (
+             SELECT 1 FROM tally_results tr
+             WHERE tr.role_id = c.role_id AND tr.candidate_id = c.id
+           )`
+        );
+        await pool.query(
+          `UPDATE election_config SET is_tally_released = TRUE, updated_at = NOW() WHERE id = $1`,
+          [rows[0].id]
+        );
+        await pool.query(
+          `INSERT INTO audit_log (actor, action, target_type, target_id, metadata)
+           VALUES ('system', 'AUTO_TALLY', 'election', $1, $2)`,
+          [electionId, JSON.stringify({ trigger: "end_date_reached", tally: tallyData })]
+        );
+        console.log(` [Auto-End] Tally released and audit logged.`);
+        autoEndFailures = 0; // reset on success
+      } else {
+        autoEndFailures++;
+        console.error(`[Auto-End] Tally failed (${tallyResp.status}, attempt ${autoEndFailures}/${MAX_AUTO_END_RETRIES}):`, tallyData);
+      }
+    } catch (e) {
+      autoEndFailures++;
+      console.error(`[Auto-End] Tally call failed (attempt ${autoEndFailures}/${MAX_AUTO_END_RETRIES}):`, e.message);
+    }
+  } catch (err) {
+    // DB not ready — skip silently
+  }
+}, 30_000);
+
+// ─── Start ───────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(` AnonyTech API running on http://localhost:${PORT}`);
+  console.log(` Crypto service at ${CRYPTO_API_URL}`);
+  console.log(` Plugin engine at ${PLUGIN_API_URL}`);
+  console.log(` Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`${'='.repeat(60)}\n`);
+});
+
+module.exports = app;
