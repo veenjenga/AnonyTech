@@ -227,3 +227,147 @@ async function ensureCryptoRegistration(studentId) {
   return regData;
 }
 
+// ============================================================
+// OTP / BLIND SIGNATURE
+// ============================================================
+
+app.post("/api/otp/send", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email is required" });
+
+  const { rows } = await pool.query(
+    `SELECT v.id, v.student_id, v.email, v.full_name, v.has_voted
+     FROM voters v WHERE LOWER(v.email) = LOWER($1) LIMIT 1`,
+    [email]
+  );
+  if (!rows.length) {
+    return res.status(404).json({ error: "No voter found with that email address" });
+  }
+
+  const voter = rows[0];
+  if (voter.has_voted) {
+    return res.status(403).json({ error: "This voter has already cast their ballot" });
+  }
+
+  const otp       = String(crypto.randomInt(100000, 999999));
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+
+  otpStore.set(email.toLowerCase(), { otp, expiresAt, voterId: voter.student_id });
+
+  const subject = "Your AnonyTech Voting OTP";
+  const text = [
+    `Hello${voter.full_name ? ` ${voter.full_name}` : ""},`,
+    ``,
+    `Your one-time password (OTP) for the AnonyTech election system is:`,
+    ``,
+    `    ${otp}`,
+    ``,
+    `This code expires in 10 minutes.`,
+    ``,
+    `If you did not request this, please ignore this email.`,
+    ``,
+    `— AnonyTech Voting System`,
+  ].join("\n");
+
+  try {
+    await sendEmail(email, subject, text);
+  } catch (err) {
+    otpStore.delete(email.toLowerCase());
+    return res.status(500).json({ error: "Failed to send OTP email. Please try again." });
+  }
+
+  const devPayload = process.env.NODE_ENV !== "production" ? { _dev_otp: otp } : {};
+  res.json({ success: true, message: "OTP sent to your email address", expiresIn: 600, ...devPayload });
+});
+
+app.post("/api/otp/verify", async (req, res) => {
+  const { otp, email, voterId } = req.body;
+  if (!otp || !email) return res.status(400).json({ error: "OTP and email are required" });
+
+  const key        = email.toLowerCase();
+  const storedData = otpStore.get(key);
+  if (!storedData)                        return res.status(400).json({ error: "No OTP found. Please request a new OTP." });
+  if (storedData.expiresAt < Date.now()) { otpStore.delete(key); return res.status(400).json({ error: "OTP has expired." }); }
+  if (storedData.otp !== otp)             return res.status(400).json({ error: "Invalid OTP code." });
+
+  const targetVoterId = voterId || storedData.voterId;
+  if (!targetVoterId) return res.status(400).json({ error: "Voter ID is required for blind signature" });
+
+  try {
+    const safeJson = async (response) => {
+      const text = await response.text();
+      try { return JSON.parse(text); } catch { return { _raw: text }; }
+    };
+
+    const seedResp = await fetch(`${CRYPTO_API_URL}/crypto/seed-voters`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ voter_ids: [targetVoterId] }),
+    });
+    if (!seedResp.ok) {
+      const seedData = await safeJson(seedResp);
+      console.warn("[Blind Signature] seed-voters warning:", seedData);
+    }
+
+    const regResp = await fetch(`${CRYPTO_API_URL}/crypto/register`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ voter_id: targetVoterId }),
+    });
+    const regData = await safeJson(regResp);
+    if (!regResp.ok) {
+      console.error("[Blind Signature] register failed:", regData);
+      return res.status(500).json({
+        error: regData?.detail || regData?._raw || "Failed to issue blind signature",
+      });
+    }
+
+    otpStore.delete(key);
+
+    const keyResp = await fetch(`${CRYPTO_API_URL}/crypto/rsa-public-key`);
+    const keyData = await safeJson(keyResp);
+    if (!keyResp.ok) {
+      console.error("[Blind Signature] rsa-public-key failed:", keyData);
+      return res.status(500).json({ error: "Failed to retrieve RSA public key" });
+    }
+
+    res.json({
+      success: true,
+      voter_id: targetVoterId,
+      rsa_public_key: keyData,
+      message: "Identity verified and blind-signature credential issued",
+    });
+  } catch (error) {
+    console.error("[Blind Signature] Error:", error);
+    res.status(500).json({ error: "Failed to issue blind signature. Please try again." });
+  }
+});
+
+if (process.env.NODE_ENV !== "production") {
+  app.post("/api/otp/test-verify", async (req, res) => {
+    const { email, voterId } = req.body;
+    if (!email || !voterId) return res.status(400).json({ error: "Email and voterId are required" });
+
+    const safeJsonTV = async (r) => { const t = await r.text(); try { return JSON.parse(t); } catch { return { _raw: t }; } };
+    try {
+      const seedR = await fetch(`${CRYPTO_API_URL}/crypto/seed-voters`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voter_ids: [voterId] }),
+      });
+      if (!seedR.ok) console.warn("[test-verify] seed-voters warning:", await safeJsonTV(seedR));
+
+      const regResp = await fetch(`${CRYPTO_API_URL}/crypto/register`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voter_id: voterId }),
+      });
+      const regData = await safeJsonTV(regResp);
+      if (!regResp.ok) return res.status(500).json({ error: regData?.detail || regData?._raw || "Failed to issue blind signature" });
+
+      const keyResp = await fetch(`${CRYPTO_API_URL}/crypto/rsa-public-key`);
+      const keyData = await safeJsonTV(keyResp);
+
+      res.json({ success: true, voter_id: voterId, rsa_public_key: keyData,
+                 message: "TEST MODE: Identity verified without OTP" });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to issue blind signature" });
+    }
+  });
+}
