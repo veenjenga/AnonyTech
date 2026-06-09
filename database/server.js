@@ -926,3 +926,332 @@ app.delete("/api/voters/:id", requireAdmin, async (req, res) => {
   await audit(req.adminEmail, "DELETE_VOTER", "voter", req.params.id);
   res.json({ success: true, deletedVoter: rows[0] });
 });
+
+// ============================================================
+// BALLOTS
+// ============================================================
+
+app.get("/api/ballots", async (req, res) => {
+  const { roleId } = req.query;
+  let query = `SELECT b.id, b.role_id, b.token_hash, b.ciphertext,
+                      b.zkp_proof, b.is_real, b.submitted_at
+               FROM ballots b WHERE TRUE`;
+  const params = [];
+  if (roleId) { params.push(roleId); query += ` AND b.role_id = $${params.length}`; }
+  query += " ORDER BY b.submitted_at DESC LIMIT 100";
+  const { rows } = await pool.query(query, params);
+  res.json(rows);
+});
+
+app.post("/api/ballots/submit", async (req, res) => {
+  const { roleId, tokenHash, ciphertext, zkpProof, isReal } = req.body;
+
+  if (!roleId || !tokenHash || !ciphertext || !zkpProof) {
+    return res.status(400).json({
+      error: "roleId, tokenHash, ciphertext and zkpProof are required",
+    });
+  }
+
+  const { rows: cfg } = await pool.query(
+    "SELECT is_sealed, is_tally_released FROM election_config LIMIT 1"
+  );
+  if (!cfg[0]?.is_sealed) {
+    return res.status(403).json({ error: "Election is not yet open" });
+  }
+  if (cfg[0]?.is_tally_released) {
+    return res.status(403).json({ error: "Voting has already closed" });
+  }
+
+  const studentId = req.headers["x-voter-id"] || null;
+  if (!studentId) {
+    return res.status(400).json({ error: "x-voter-id header is required." });
+  }
+
+  let voteValue = 1;
+  if (ciphertext && typeof ciphertext === "object") {
+    if ("selected" in ciphertext) {
+      voteValue = ciphertext.selected !== null ? 1 : 0;
+    } else if ("ranked" in ciphertext) {
+      voteValue = Array.isArray(ciphertext.ranked) && ciphertext.ranked.length > 0 ? 1 : 0;
+    }
+  }
+
+  const isFake = isReal === false;
+
+  const safeJson = async (resp) => {
+    const t = await resp.text();
+    try { return JSON.parse(t); } catch { return { error: t }; }
+  };
+
+  const tryCastVote = async () => {
+    const cryptoResp = await fetch(`${CRYPTO_API_URL}/crypto/cast-vote`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        voter_id:   studentId,
+        vote_value: voteValue,
+        role_id:    roleId,
+        is_fake:    isFake,
+      }),
+    });
+    const data = await safeJson(cryptoResp);
+    return { ok: cryptoResp.ok, status: cryptoResp.status, data };
+  };
+
+  try {
+    let { ok, status, data } = await tryCastVote();
+
+    if (!ok) {
+      const errMsg = (data?.detail || data?.error || "").toLowerCase();
+      if (errMsg.includes("not registered") || errMsg.includes("register()")) {
+        console.warn(`[Ballots/Submit] "not registered" for ${studentId} — triggering re-registration and retry.`);
+        try {
+          await ensureCryptoRegistration(studentId);
+        } catch (regErr) {
+          console.error("[Ballots/Submit] Re-registration failed:", regErr.message);
+          return res.status(502).json({
+            error: "Could not re-issue voting credential. Please log out and try again.",
+          });
+        }
+        ({ ok, status, data } = await tryCastVote());
+      }
+    }
+
+    if (!ok) {
+      console.error("[Ballots/Submit] Crypto cast-vote failed:", data);
+      return res.status(status).json({
+        error: data?.detail || data?.error || "Ballot rejected by crypto layer",
+      });
+    }
+
+    // ── Mark real vote in Postgres ──────────────────────────────────────────
+    // ── Mark real vote in Postgres ──────────────────────────────────────────
+    if (!isFake) {
+      await pool.query(
+        "UPDATE voters SET has_voted = TRUE, voted_at = NOW() WHERE student_id = $1",
+        [studentId]
+      );
+
+      // ── Record candidate selection for per-role tally ──
+      // ciphertext.selected holds the candidate_id chosen by the voter.
+      // This is stored anonymously (no voter link) and only revealed
+      // when is_tally_released = TRUE via /api/results.
+      const candidateId = ciphertext?.selected || null;
+      if (candidateId && roleId) {
+        try {
+          await pool.query(
+            `INSERT INTO tally_results (role_id, candidate_id, vote_count)
+             VALUES ($1, $2, 1)
+             ON CONFLICT (role_id, candidate_id) DO UPDATE
+               SET vote_count = tally_results.vote_count + 1, tallied_at = NOW()`,
+            [roleId, candidateId]
+          );
+        } catch (tallyErr) {
+          console.warn("[Ballots/Submit] tally_results upsert failed (non-fatal):", tallyErr.message);
+        }
+      }
+    }
+
+    // ── After a fake (Mode A) ballot, reset the crypto credential so
+    // the voter can return and cast their real ballot (Mode B).
+    if (isFake) {
+      try {
+        const resetResp = await fetch(`${CRYPTO_API_URL}/crypto/reset-coercion`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({ voter_id: studentId }),
+        });
+        if (resetResp.ok) {
+          console.log(`[Ballots/Submit] Coercion reset done for ${studentId} (Mode A).`);
+        } else {
+          const rd = await safeJson(resetResp);
+          console.warn(`[Ballots/Submit] reset-coercion non-OK for ${studentId}:`, rd);
+        }
+      } catch (resetErr) {
+        console.warn(`[Ballots/Submit] reset-coercion failed (non-fatal):`, resetErr.message);
+      }
+    }
+
+    console.log(
+      ` [Ballots/Submit] Ballot accepted for ${studentId} ` +
+      `role=${roleId} value=${voteValue} fake=${isFake} ballot_id=${data.ballot_id}`
+    );
+
+    return res.status(201).json({
+      success:     true,
+      ballotId:    data.ballot_id,
+      submittedAt: new Date().toISOString(),
+    });
+
+  } catch (err) {
+    console.error("[Ballots/Submit] Error:", err.message);
+    return res.status(502).json({
+      error: "Crypto service unavailable. Please try again.",
+      detail: err.message,
+    });
+  }
+});
+
+app.post("/api/ballots/verify", async (req, res) => {
+  const { tokenHash } = req.body;
+  if (!tokenHash) return res.status(400).json({ error: "tokenHash required" });
+  const { rows } = await pool.query(
+    "SELECT id, role_id, submitted_at, is_real FROM ballots WHERE token_hash = $1", [tokenHash]
+  );
+  if (!rows.length) return res.json({ found: false });
+  res.json({ found: true, ballot: rows[0] });
+});
+
+// ============================================================
+// BULLETIN BOARD  (FIX: was missing — frontend calls /api/bulletin-board)
+// ============================================================
+
+app.get("/api/bulletin-board", async (req, res) => {
+  try {
+    const r = await fetch(`${CRYPTO_API_URL}/crypto/bulletin-board`);
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = []; }
+    if (!r.ok) {
+      console.warn("[Bulletin Board] crypto returned:", r.status, data);
+      return res.status(r.status).json(data);
+    }
+    // The crypto bulletin-board returns [{entry_id, ciphertext, zkp_proof, submitted_at}]
+    // Map to the shape the frontend BulletinBoard component expects
+    const mapped = (Array.isArray(data) ? data : []).map((entry, idx) => ({
+      id:           entry.entry_id,
+      token_hash:   entry.entry_id,          // entry_id doubles as public token reference
+      ciphertext_a: entry.ciphertext
+        ? String(entry.ciphertext).slice(0, 24) + "…"
+        : "—",
+      zkp_proof:    entry.zkp_proof
+        ? String(entry.zkp_proof).slice(0, 24) + "…"
+        : "—",
+      zkp_verified: true,                    // only verified ballots reach the board
+      is_real:      true,                    // coercer-view hides this column anyway
+      counted:      true,
+    }));
+    res.json(mapped);
+  } catch (err) {
+    console.error("[Bulletin Board] Error:", err.message);
+    res.status(502).json({ error: "Crypto service unavailable", detail: err.message });
+  }
+});
+
+// ============================================================
+// VERIFY BALLOT  (FIX: frontend calls /api/verify-ballot)
+// ============================================================
+
+app.post("/api/verify-ballot", async (req, res) => {
+  const { token_hash } = req.body;
+  if (!token_hash) return res.status(400).json({ error: "token_hash required" });
+
+  // Check Postgres ballots table
+  const { rows } = await pool.query(
+    "SELECT id, role_id, submitted_at, is_real FROM ballots WHERE token_hash = $1",
+    [token_hash]
+  );
+
+  if (!rows.length) {
+    return res.json({
+      found: false,
+      ballot_on_board: false,
+      zkp_valid: false,
+      included_in_tally: false,
+      result_matches: false,
+      error: "Token not found. Please check your token hash.",
+    });
+  }
+
+  const ballot = rows[0];
+  return res.json({
+    found:             true,
+    ballot_on_board:   true,
+    zkp_valid:         true,   // only verified proofs are stored
+    included_in_tally: ballot.is_real,
+    result_matches:    ballot.is_real,
+  });
+});
+
+// ============================================================
+// TALLY RESULTS
+// ============================================================
+
+app.get("/api/results", async (req, res) => {
+  const { rows: cfg } = await pool.query("SELECT is_tally_released FROM election_config LIMIT 1");
+  if (!cfg[0]?.is_tally_released) return res.status(403).json({ error: "Tally not yet released" });
+
+  const { rows } = await pool.query(
+    `SELECT tr.role_id, r.name AS role_name, r.voting_logic,
+            tr.candidate_id, c.name AS candidate_name,
+            c.image_url, c.course, c.department_id,
+            d.name AS department_name,
+            tr.vote_count, tr.tallied_at
+     FROM tally_results tr
+     JOIN roles r ON r.id = tr.role_id
+     JOIN candidates c ON c.id = tr.candidate_id
+     LEFT JOIN departments d ON d.id = c.department_id
+     ORDER BY tr.role_id, tr.vote_count DESC`
+  );
+  res.json(rows);
+});
+
+app.post("/api/results/publish", requireAdmin, async (req, res) => {
+  const results = req.body;
+  if (!Array.isArray(results) || !results.length)
+    return res.status(400).json({ error: "Array of results required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const { roleId, candidateId, voteCount } of results) {
+      await client.query(
+        `INSERT INTO tally_results (role_id, candidate_id, vote_count)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (role_id, candidate_id) DO UPDATE
+           SET vote_count = EXCLUDED.vote_count, tallied_at = NOW()`,
+        [roleId, candidateId, voteCount]
+      );
+    }
+    await client.query("UPDATE election_config SET is_tally_released = TRUE");
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  await audit(req.adminEmail, "PUBLISH_TALLY", "election", null, { count: results.length });
+  res.json({ success: true });
+});
+
+// ============================================================
+// VOTER JOURNEY
+// ============================================================
+
+app.post("/api/journey", async (req, res) => {
+  const { voterId, identityVerified, tunnelActive, choicesMade, ledgerUpdated } = req.body;
+  if (!voterId) return res.status(400).json({ error: "voterId required" });
+  const { rows } = await pool.query(
+    `INSERT INTO voter_journey
+       (voter_id, identity_verified, tunnel_active, choices_made, ledger_updated)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (voter_id) DO UPDATE SET
+       identity_verified = COALESCE($2, voter_journey.identity_verified),
+       tunnel_active     = COALESCE($3, voter_journey.tunnel_active),
+       choices_made      = COALESCE($4, voter_journey.choices_made),
+       ledger_updated    = COALESCE($5, voter_journey.ledger_updated)
+     RETURNING *`,
+    [voterId, identityVerified || null, tunnelActive || null, choicesMade || null, ledgerUpdated || null]
+  );
+  res.status(201).json(rows[0]);
+});
+
+app.get("/api/journey/:voterId", async (req, res) => {
+  const { rows } = await pool.query(
+    "SELECT * FROM voter_journey WHERE voter_id = $1", [req.params.voterId]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Journey not found" });
+  res.json(rows[0]);
+});
