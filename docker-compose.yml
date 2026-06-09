@@ -1,0 +1,153 @@
+version: "3.9"
+
+services:
+
+  # ─── Primary Database ──────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: evoting_postgres
+    environment:
+      POSTGRES_USER: evoting
+      POSTGRES_PASSWORD: evoting_secret
+      POSTGRES_DB: evoting_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=5
+        -c wal_keep_size=256
+        -c archive_mode=on
+        -c archive_command='cp %p /var/lib/postgresql/wal_archive/%f'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evoting"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis Session Cache (AOF enabled) ────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: evoting_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── CockroachDB Node 1 ────────────────────────────────────────────────────
+  cockroach1:
+    image: cockroachdb/cockroach:v23.2.0
+    container_name: evoting_cockroach1
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    volumes:
+      - cockroach1_data:/cockroach/cockroach-data
+    command: start --insecure --join=cockroach1,cockroach2,cockroach3 --listen-addr=0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ─── CockroachDB Node 2 ────────────────────────────────────────────────────
+  cockroach2:
+    image: cockroachdb/cockroach:v23.2.0
+    container_name: evoting_cockroach2
+    volumes:
+      - cockroach2_data:/cockroach/cockroach-data
+    command: start --insecure --join=cockroach1,cockroach2,cockroach3 --listen-addr=0.0.0.0
+    depends_on:
+      - cockroach1
+
+  # ─── CockroachDB Node 3 ────────────────────────────────────────────────────
+  cockroach3:
+    image: cockroachdb/cockroach:v23.2.0
+    container_name: evoting_cockroach3
+    volumes:
+      - cockroach3_data:/cockroach/cockroach-data
+    command: start --insecure --join=cockroach1,cockroach2,cockroach3 --listen-addr=0.0.0.0
+    depends_on:
+      - cockroach1
+
+  # ─── CockroachDB Init (runs once) ─────────────────────────────────────────
+  cockroach-init:
+    image: cockroachdb/cockroach:v23.2.0
+    container_name: evoting_cockroach_init
+    depends_on:
+      - cockroach1
+      - cockroach2
+      - cockroach3
+    command: init --insecure --host=cockroach1
+    restart: on-failure
+
+  # ─── Prometheus ───────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: evoting_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./docker/prometheus/alerts.yml:/etc/prometheus/alerts.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+
+  # ─── Grafana ──────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: evoting_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+
+  # ─── FastAPI Application ──────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: evoting_api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://evoting:evoting_secret@postgres:5432/evoting_db
+      - REDIS_URL=redis://redis:6379
+      - COCKROACH_URL=postgresql://root@cockroach1:26257/evoting?sslmode=disable
+      - ACTIVE_METHOD=plurality
+      - PROMETHEUS_PORT=8001
+    volumes:
+      - ./app:/app/app
+      - ./config:/app/config
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  cockroach1_data:
+  cockroach2_data:
+  cockroach3_data:
+  prometheus_data:
+  grafana_data:
