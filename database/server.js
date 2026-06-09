@@ -618,3 +618,311 @@ app.post("/api/config/reset", requireAdmin, async (req, res) => {
     message: "Election fully reset. All voters can now participate in the new election.",
   });
 });
+// ============================================================
+// DEPARTMENTS
+// ============================================================
+
+app.get("/api/departments", async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT d.*, des.is_sealed, des.is_tally_released
+     FROM departments d
+     LEFT JOIN dept_election_states des ON des.department_id = d.id
+     ORDER BY d.name`
+  );
+  res.json(rows);
+});
+
+app.get("/api/departments/:id", async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT d.*, des.is_sealed, des.is_tally_released
+     FROM departments d
+     LEFT JOIN dept_election_states des ON des.department_id = d.id
+     WHERE d.id = $1`,
+    [req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Department not found" });
+  res.json(rows[0]);
+});
+
+app.post("/api/departments", requireAdmin, async (req, res) => {
+  const { id, name, fullName, prefix } = req.body;
+  if (!id || !name || !prefix) return res.status(400).json({ error: "id, name and prefix are required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `INSERT INTO departments (id, name, full_name, prefix) VALUES ($1, $2, $3, $4) RETURNING *`,
+      [id, name, fullName || name, prefix.toUpperCase().slice(0, 3)]
+    );
+    await client.query(
+      `INSERT INTO dept_election_states (department_id, is_sealed, is_tally_released) VALUES ($1, FALSE, FALSE) ON CONFLICT DO NOTHING`,
+      [id]
+    );
+    await client.query("COMMIT");
+    await audit(req.adminEmail, "ADD_DEPARTMENT", "department", id, { name });
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/api/departments/:id", requireAdmin, async (req, res) => {
+  const { name, fullName, prefix } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE departments SET
+       name      = COALESCE($1, name),
+       full_name = COALESCE($2, full_name),
+       prefix    = COALESCE($3, prefix)
+     WHERE id = $4 RETURNING *`,
+    [name ?? null, fullName ?? null,
+     prefix ? prefix.toUpperCase().slice(0, 3) : null, req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Department not found" });
+  await audit(req.adminEmail, "UPDATE_DEPARTMENT", "department", req.params.id, req.body);
+  res.json(rows[0]);
+});
+
+app.delete("/api/departments/:id", requireAdmin, async (req, res) => {
+  await pool.query("DELETE FROM departments WHERE id = $1", [req.params.id]);
+  await audit(req.adminEmail, "DELETE_DEPARTMENT", "department", req.params.id);
+  res.json({ success: true });
+});
+
+app.patch("/api/departments/:id/state", requireAdmin, async (req, res) => {
+  const { isSealed, isTallyReleased } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO dept_election_states (department_id, is_sealed, is_tally_released)
+     VALUES ($1, COALESCE($2, FALSE), COALESCE($3, FALSE))
+     ON CONFLICT (department_id) DO UPDATE SET
+       is_sealed         = COALESCE($2, dept_election_states.is_sealed),
+       is_tally_released = COALESCE($3, dept_election_states.is_tally_released),
+       updated_at        = NOW()
+     RETURNING *`,
+    [req.params.id, isSealed ?? null, isTallyReleased ?? null]
+  )
+  await audit(req.adminEmail, "UPDATE_DEPT_STATE", "department", req.params.id, req.body);
+  res.json(rows[0]);
+});
+
+// ============================================================
+// ROLES
+// ============================================================
+
+app.get("/api/roles", async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM roles ORDER BY name");
+  res.json(rows);
+});
+
+app.post("/api/roles", requireAdmin, async (req, res) => {
+  const { id, name, votingLogic } = req.body;
+  if (!id || !name) return res.status(400).json({ error: "id and name are required" });
+  const { rows } = await pool.query(
+    `INSERT INTO roles (id, name, voting_logic) VALUES ($1, $2, $3) RETURNING *`,
+    [id, name, votingLogic || "Plurality"]
+  );
+  await audit(req.adminEmail, "ADD_ROLE", "role", id, { name, votingLogic });
+  res.status(201).json(rows[0]);
+});
+
+app.put("/api/roles/:id", requireAdmin, async (req, res) => {
+  const { name, votingLogic } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE roles SET name = COALESCE($1, name), voting_logic = COALESCE($2, voting_logic)
+     WHERE id = $3 RETURNING *`,
+    [name ?? null, votingLogic ?? null, req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Role not found" });
+  await audit(req.adminEmail, "UPDATE_ROLE", "role", req.params.id, req.body);
+  res.json(rows[0]);
+});
+
+app.delete("/api/roles/:id", requireAdmin, async (req, res) => {
+  await pool.query("DELETE FROM roles WHERE id = $1", [req.params.id]);
+  await audit(req.adminEmail, "DELETE_ROLE", "role", req.params.id);
+  res.json({ success: true });
+});
+
+// ============================================================
+// CANDIDATES
+// ============================================================
+
+app.get("/api/candidates", async (req, res) => {
+  const { roleId, departmentId } = req.query;
+  let query = "SELECT * FROM candidates WHERE TRUE";
+  const params = [];
+  if (roleId)       { params.push(roleId);       query += ` AND role_id = $${params.length}`; }
+  if (departmentId) { params.push(departmentId); query += ` AND department_id = $${params.length}`; }
+  query += " ORDER BY name";
+  const { rows } = await pool.query(query, params);
+  res.json(rows);
+});
+
+app.post("/api/candidates", requireAdmin, async (req, res) => {
+  const { id, roleId, departmentId, name, course, imageUrl } = req.body;
+  if (!id || !roleId || !departmentId || !name)
+    return res.status(400).json({ error: "id, roleId, departmentId and name are required" });
+  const { rows } = await pool.query(
+    `INSERT INTO candidates (id, role_id, department_id, name, course, image_url)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [id, roleId, departmentId, name, course || null, imageUrl || null]
+  );
+  await audit(req.adminEmail, "ADD_CANDIDATE", "candidate", id, { name, roleId, departmentId });
+  res.status(201).json(rows[0]);
+});
+
+app.put("/api/candidates/:id", requireAdmin, async (req, res) => {
+  const { name, course, imageUrl } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE candidates SET
+       name      = COALESCE($1, name),
+       course    = COALESCE($2, course),
+       image_url = COALESCE($3, image_url)
+     WHERE id = $4 RETURNING *`,
+    [name ?? null, course ?? null, imageUrl ?? null, req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Candidate not found" });
+  await audit(req.adminEmail, "UPDATE_CANDIDATE", "candidate", req.params.id, req.body);
+  res.json(rows[0]);
+});
+
+app.delete("/api/candidates/:id", requireAdmin, async (req, res) => {
+  await pool.query("DELETE FROM candidates WHERE id = $1", [req.params.id]);
+  await audit(req.adminEmail, "DELETE_CANDIDATE", "candidate", req.params.id);
+  res.json({ success: true });
+});
+
+// ============================================================
+// VOTERS
+// ============================================================
+
+app.get("/api/voters", requireAdmin, async (req, res) => {
+  const { role } = req.query;
+  const params = [];
+  let filter = "";
+  if (role) { params.push(role); filter = `AND v.role = $${params.length}`; }
+  const { rows } = await pool.query(
+    `SELECT v.id, v.student_id, v.email, v.full_name,
+            v.department_id, v.role, v.has_voted,
+            v.registered_at, v.voted_at,
+            d.name AS department_name
+     FROM voters v
+     LEFT JOIN departments d ON d.id = v.department_id
+     WHERE TRUE ${filter}
+     ORDER BY v.registered_at DESC`,
+    params
+  );
+  res.json(rows);
+});
+
+app.post("/api/voters/register", async (req, res) => {
+  const records = Array.isArray(req.body) ? req.body : [req.body];
+
+  const callerEmail = req.headers["x-admin-email"];
+  let callerIsAdmin = false;
+  if (callerEmail) {
+    const { rows: adminCheck } = await pool.query(
+      "SELECT role FROM voters WHERE LOWER(email) = LOWER($1) LIMIT 1", [callerEmail]
+    );
+    callerIsAdmin = adminCheck[0]?.role === "admin";
+  }
+
+  const actor   = callerEmail || "system";
+  const results = [];
+
+  for (const { studentId, email, fullName, role, password } of records) {
+    if (!studentId || !email) continue;
+    if (!callerIsAdmin && !password)
+      return res.status(400).json({ error: "password is required for voter registration" });
+
+    let passwordHash = null;
+    if (password) passwordHash = await bcrypt.hash(password, 12);
+
+    const assignedRole = callerIsAdmin && role === "admin" ? "admin" : "voter";
+    const prefix = studentId.slice(0, 3).toUpperCase();
+    const { rows: deptRows } = await pool.query(
+      "SELECT id FROM departments WHERE prefix = $1 LIMIT 1", [prefix]
+    );
+    const departmentId = deptRows[0]?.id || null;
+
+    const { rows } = await pool.query(
+      `INSERT INTO voters (student_id, email, full_name, department_id, role, password_hash)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (email) DO UPDATE SET
+         full_name     = EXCLUDED.full_name,
+         department_id = COALESCE(EXCLUDED.department_id, voters.department_id),
+         password_hash = COALESCE(EXCLUDED.password_hash, voters.password_hash)
+       RETURNING id, student_id, email, full_name, department_id, role`,
+      [studentId, email, fullName || null, departmentId, assignedRole, passwordHash]
+    );
+    results.push(rows[0]);
+  }
+
+  await audit(actor, "REGISTER_VOTERS", "voter", null, { count: results.length });
+  res.status(201).json(results.length === 1 ? results[0] : results);
+});
+
+app.post("/api/voters/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  const { rows } = await pool.query(
+    `SELECT v.id, v.student_id, v.email, v.full_name,
+            v.has_voted, v.role, v.password_hash,
+            v.department_id, d.name AS department_name, d.prefix
+     FROM voters v
+     LEFT JOIN departments d ON d.id = v.department_id
+     WHERE LOWER(v.email) = LOWER($1)`,
+    [email]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Voter not found or not eligible" });
+
+  const voter = rows[0];
+  if (voter.password_hash) {
+    if (!password) return res.status(401).json({ error: "Password required" });
+    const valid = await bcrypt.compare(password, voter.password_hash);
+    if (!valid)   return res.status(401).json({ error: "Invalid password" });
+  }
+
+  const { password_hash: _omit, ...safeVoter } = voter;
+  res.json(safeVoter);
+});
+
+app.patch("/api/voters/:id/password", async (req, res) => {
+  const { password } = req.body;
+  if (!password || password.length < 6)
+    return res.status(400).json({ error: "password must be at least 6 characters" });
+  const passwordHash = await bcrypt.hash(password, 12);
+  const { rows } = await pool.query(
+    `UPDATE voters SET password_hash = $1 WHERE id = $2 RETURNING id, email, full_name, role`,
+    [passwordHash, req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Voter not found" });
+  res.json({ success: true, voter: rows[0] });
+});
+
+app.patch("/api/voters/:id/role", requireAdmin, async (req, res) => {
+  const { role } = req.body;
+  if (!["admin", "voter"].includes(role))
+    return res.status(400).json({ error: "role must be 'admin' or 'voter'" });
+  const { rows } = await pool.query(
+    `UPDATE voters SET role = $1 WHERE id = $2
+     RETURNING id, student_id, email, full_name, role, department_id`,
+    [role, req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Voter not found" });
+  await audit(req.adminEmail, "UPDATE_VOTER_ROLE", "voter", req.params.id, { role });
+  res.json(rows[0]);
+});
+
+app.delete("/api/voters/:id", requireAdmin, async (req, res) => {
+  const { rows } = await pool.query(
+    "DELETE FROM voters WHERE id = $1 RETURNING *", [req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Voter not found" });
+  await audit(req.adminEmail, "DELETE_VOTER", "voter", req.params.id);
+  res.json({ success: true, deletedVoter: rows[0] });
+});
