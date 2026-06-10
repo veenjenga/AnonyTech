@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from 'vite'
 import path from 'path'
 import tailwindcss from '@tailwindcss/vite'
@@ -33,4 +34,11 @@ export default defineConfig({
 
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.
   assetsInclude: ['**/*.svg', '**/*.csv'],
+
+  // Test configuration for Vitest
+  test: {
+    globals: true,
+    include: ['src/__tests__/**/*.test.ts'],
+    setupFiles: ['src/__tests__/setup.ts'],
+  },
 })
